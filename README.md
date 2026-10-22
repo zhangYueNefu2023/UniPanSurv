@@ -1,85 +1,113 @@
-# UniPanSurv core model
+# UniPanSurv
 
-This repository contains the core PyTorch implementation of UniPanSurv. It
-includes the model, censoring-aware survival loss, zero-shot inference and the
-lightweight few-shot target adapter.
+UniPanSurv is a PyTorch implementation of a shared pan-cancer survival model for
+incomplete RNA, miRNA and protein profiles. The package provides the core model,
+a censoring-aware discrete-time survival objective, source-cancer training
+primitives, zero-shot inference through a learned Unknown cancer context, and a
+restricted target-cancer adapter for few-shot use.
 
-## Model components
+## Core architecture
 
-For each patient, UniPanSurv:
+For each patient, the implemented model:
 
-1. converts every observed assay-qualified molecular measurement into a 64-D
-   token using the molecular identifier, omics type and standardised value;
-2. scores all directed non-self molecular pairs observed within that patient;
-3. processes pairs in blocks and pools them into eight relation summaries for
-   each of the nine directed omics blocks;
-4. keeps the original molecular tokens read-only and separately constructs
-   relation, omics and clinical summaries;
-5. fuses the three evidence streams into one 64-D patient representation; and
-6. predicts interval hazards and a survival curve over 15 time intervals.
+1. converts each observed assay-qualified molecular measurement into a
+   64-dimensional token using its feature identifier, omics type and standardized
+   value;
+2. evaluates directed non-self molecular pairs within the patient;
+3. processes pairs in bounded chunks and summarizes each of the nine directed
+   RNA/miRNA/protein blocks with eight learned relation queries;
+4. retains the original molecular tokens as a separate omics evidence stream;
+5. combines relation, omics and clinical summaries with masked gated fusion; and
+6. predicts hazards and survival probabilities over 15 discrete time intervals.
 
-One backbone is shared across source cancers. Zero-shot prediction uses the
-learned Unknown context. Few-shot adaptation freezes the source backbone and
-updates only a target context, rank-4 relation LoRA, patient adapter and
-interval-specific risk calibration.
+The source model contains cancer-specific contexts and an additional learned
+Unknown context. Zero-shot inference uses the Unknown context. Few-shot
+adaptation freezes the source model and updates only the target-specific context,
+rank-4 relation LoRA parameters, a residual patient adapter and interval-specific
+risk calibration.
 
 ## Repository layout
 
 ```text
-UniPanSurv-core/
-├── pyproject.toml
-├── README.md
+UniPanSurv/
+├── configs/
+│   ├── a100_4gpu.json
+│   ├── rtx4090_2gpu.json
+│   └── ablations.json
 ├── examples/
 │   └── minimal_usage.py
-├── src/unipansurv/
-│   ├── __init__.py
-│   ├── adaptation.py
-│   ├── config.py
-│   ├── layers.py
-│   ├── losses.py
-│   ├── model.py
-│   └── types.py
-└── tests/
-    └── test_core.py
+├── src/
+│   └── unipansurv/
+│       ├── __init__.py
+│       ├── adaptation.py
+│       ├── config.py
+│       ├── layers.py
+│       ├── losses.py
+│       ├── model.py
+│       └── types.py
+├── tests/
+│   └── test_core.py
+├── pyproject.toml
+├── requirements.txt
+└── README.md
 ```
 
-## Installation
+## Requirements and installation
+
+- Python 3.9 or newer
+- PyTorch 2.2 or newer
 
 ```bash
-git clone <YOUR-GITHUB-URL>
-cd UniPanSurv-core
+git clone https://github.com/zhangYueNefu2023/UniPanSurv.git
+cd UniPanSurv
 python -m pip install -e ".[dev]"
 pytest
 ```
 
-## Required input format
+Run the included minimal example with:
 
-The repository intentionally starts after cohort construction and
-training-only preprocessing. Each `PatientInput` contains:
+```bash
+python examples/minimal_usage.py
+```
 
-| Field | Shape | Meaning |
+The tests cover output shapes, monotonic survival probabilities, permutation
+invariance to molecular-token order, use of the Unknown context in zero-shot
+mode, single-token inputs, and gradient flow through the target adapter.
+
+## Model-ready input
+
+The public model API starts after cohort construction, feature selection and
+training-fold preprocessing. Each `PatientInput` contains:
+
+| Field | Shape | Description |
 |---|---:|---|
 | `feature_ids` | `[N]` | Assay-qualified feature identifiers |
-| `omics_ids` | `[N]` | `0=RNA`, `1=miRNA`, `2=protein` |
-| `values` | `[N]` | Transformed and training-standardised values |
-| `molecular_mask` | `[N]` | Optional observation mask |
-| `clinical_values` | `[C]` | Training-standardised baseline variables |
-| `clinical_mask` | `[C]` | Observed clinical variables |
-| `cancer_id` | scalar | Source-cancer identifier in source mode |
+| `omics_ids` | `[N]` | Omics identifiers: `0=RNA`, `1=miRNA`, `2=protein` |
+| `values` | `[N]` | Transformed and training-standardized molecular values |
+| `molecular_mask` | `[N]` | Optional mask identifying observed molecular values |
+| `clinical_values` | `[C]` | Training-standardized baseline clinical variables |
+| `clinical_mask` | `[C]` | Mask identifying observed clinical variables |
+| `cancer_id` | scalar | Source-cancer identifier used in source mode |
 
-The same biological name measured by different assays must receive different
-feature identifiers. Missing molecular measurements must be removed or masked;
-they are never converted into artificial molecular relations. Feature maps,
-means, standard deviations and time-interval boundaries must be estimated from
-the training partition and then reused unchanged for validation and test data.
+The same biological entity measured by different assays must receive different
+feature identifiers. Missing molecular values must be removed or masked rather
+than converted into artificial molecular relations. Feature selection, feature
+identifier mapping, transformations, standardization parameters and time-bin
+boundaries must be estimated using the training partition and then applied
+unchanged to validation and test data.
 
-## Minimal use
+## Minimal model use
 
 ```python
 import torch
+
 from unipansurv import PatientInput, UniPanSurv, UniPanSurvConfig
 
-config = UniPanSurvConfig(num_features=63_028, num_source_cancers=18)
+config = UniPanSurvConfig(
+    num_features=2048,
+    num_source_cancers=18,
+    pair_chunk_size=262_144,
+)
 model = UniPanSurv(config)
 
 patient = PatientInput(
@@ -94,12 +122,14 @@ patient = PatientInput(
 model.eval()
 with torch.no_grad():
     output = model([patient], mode="source")
-    print(output.survival.shape)  # [1, 15]
+    print(output.survival.shape)  # torch.Size([1, 15])
 ```
 
-`PatientInput` objects and the model must be placed on the same device.
+`PatientInput` tensors and the model must be located on the same device.
+`num_features` is the size of the processed assay-qualified feature vocabulary;
+valid feature identifiers therefore range from `0` to `num_features - 1`.
 
-## Source-cancer training
+## Source-cancer objective
 
 ```python
 from unipansurv import cancer_balance_weights, discrete_time_survival_nll
@@ -120,12 +150,13 @@ loss = discrete_time_survival_nll(
 loss.backward()
 ```
 
-During source training, the model jointly replaces the cancer context and risk
-calibration with their Unknown versions for a random fraction of patients. It
-also applies whole-modality dropout while retaining at least one observed
-modality.
+`training_cancer_counts` must be calculated from the complete training
+partition, not from an individual mini-batch. During source-mode training, the
+model can replace source-cancer context and calibration with their Unknown
+counterparts and can remove whole observed modalities according to the
+probabilities stored in the configuration.
 
-## Zero-shot prediction
+## Zero-shot inference
 
 ```python
 model.eval()
@@ -133,13 +164,15 @@ with torch.no_grad():
     output = model(target_patients, mode="zero_shot")
 ```
 
-Zero-shot mode always uses the Unknown context and calibration. Any `cancer_id`
-stored in the input is ignored. No target survival outcome is consumed by this
-forward pass.
+Zero-shot mode always uses the Unknown cancer context and Unknown calibration.
+Any `cancer_id` stored in a target input is ignored by the zero-shot forward
+pass. No target survival outcome is consumed during prediction.
 
 ## Few-shot adaptation
 
 ```python
+import torch
+
 from unipansurv import discrete_time_survival_nll
 
 model.freeze_backbone()
@@ -159,22 +192,50 @@ for patients, interval_index, event in adaptation_loader:
     optimizer.step()
 ```
 
-The independent target test set must never be used to fit the adapter, choose
-hyperparameters or determine stopping time.
+The adaptation subset and independent target test subset must remain separate.
+Target-test outcomes must not be used to fit the adapter, select
+hyperparameters, or determine the stopping point.
 
-## Notes on complete relation learning
+## Experiment configuration snapshots
 
-The implementation does not use positional encoding, top-k filtering,
-PPI/pathway priors or patient-to-patient edges. Pair scores are processed in
-chunks controlled by `pair_chunk_size`, but every valid directed pair is still
-included. Chunking reduces the largest temporary tensor; it does not change the
-quadratic number of pair evaluations.
+The `configs/` directory records the experiment settings associated with the
+revision:
 
-## Reproducibility boundary
+- `a100_4gpu.json` describes a four-GPU NVIDIA A100 job with 80 GB memory per
+  GPU, two patients per GPU and an expected global batch size of eight.
+- `rtx4090_2gpu.json` describes a two-GPU NVIDIA RTX 4090 job with one patient
+  per GPU, four gradient-accumulation steps and an expected effective global
+  batch size of eight.
+- `ablations.json` records the prespecified relation, modality, modality-dropout
+  and survival-head comparison matrix.
 
-This repository defines the architecture and loss but does not include trained
-weights or claim any performance result. A reproducible study should separately
-release cohort identifiers, partition files, training-only preprocessing
-parameters, time-bin boundaries, random seeds and locked evaluation code where
-data-use agreements permit.
+The distributed cluster comprised four NVIDIA A100 80 GB GPUs and six NVIDIA
+RTX 4090 24 GB GPUs. A100 jobs used four GPUs. The supplied RTX 4090 profile
+describes a two-GPU job scheduled within the six-GPU RTX 4090 pool; A100 and RTX
+4090 devices were not mixed within a single distributed job.
 
+## Configuration scope
+
+The public core forward path currently implements complete relation learning
+and the discrete-time survival head. The additional values accepted by
+`UniPanSurvConfig`—including `relation_mode`, alternative survival-head names,
+top-k settings and DeepHit ranking settings—and the entries in
+`configs/ablations.json` are experiment specifications. 
+
+## Complete-relation computation
+
+The default model does not use positional encodings, top-k filtering,
+PPI/pathway restrictions, or patient-to-patient graph edges. Every valid
+directed non-self molecular pair is included. `pair_chunk_size` is the maximum
+number of directed edges materialized at one time; chunking reduces temporary
+memory use but does not change the set or total number of evaluated pairs.
+
+## Code availability
+
+The public repository is available at:
+
+https://github.com/zhangYueNefu2023/UniPanSurv
+
+No software license file is currently included. In the absence of an explicit
+license, use and redistribution remain subject to applicable copyright law and
+permission from the copyright holders.
