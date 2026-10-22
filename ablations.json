@@ -1,0 +1,23 @@
+{
+  "experiments": [
+    {"name": "relation_full", "overrides": {"model": {"relation_mode": "full"}}},
+    {"name": "relation_ppi", "overrides": {"model": {"relation_mode": "ppi"}}},
+    {"name": "relation_topk", "overrides": {"model": {"relation_mode": "topk"}}},
+    {"name": "relation_mlp_control", "overrides": {"model": {"relation_mode": "mlp_control"}}},
+    {"name": "relation_none", "overrides": {"model": {"relation_mode": "none"}}},
+    {"name": "relation_random_scores", "overrides": {"model": {"relation_mode": "random_scores"}}},
+    {"name": "relation_writeback", "overrides": {"model": {"relation_mode": "writeback"}}},
+    {"name": "modality_rna", "overrides": {"data": {"modalities": [0]}}},
+    {"name": "modality_mirna", "overrides": {"data": {"modalities": [1]}}},
+    {"name": "modality_protein", "overrides": {"data": {"modalities": [2]}}},
+    {"name": "modality_rna_mirna", "overrides": {"data": {"modalities": [0, 1]}}},
+    {"name": "modality_rna_protein", "overrides": {"data": {"modalities": [0, 2]}}},
+    {"name": "modality_mirna_protein", "overrides": {"data": {"modalities": [1, 2]}}},
+    {"name": "modality_all", "overrides": {"data": {"modalities": [0, 1, 2]}}},
+    {"name": "no_modality_dropout", "overrides": {"model": {"modality_dropout_probability": 0.0}}},
+    {"name": "head_discrete", "overrides": {"model": {"survival_head": "discrete"}}},
+    {"name": "head_mtlr", "overrides": {"model": {"survival_head": "mtlr"}}},
+    {"name": "head_deephit", "overrides": {"model": {"survival_head": "deephit"}}},
+    {"name": "head_cox", "overrides": {"model": {"survival_head": "cox"}}}
+  ]
+}

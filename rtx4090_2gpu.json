@@ -1,0 +1,48 @@
+{
+  "model": {
+    "num_features": 2048,
+    "num_source_cancers": 18,
+    "num_clinical_features": 3,
+    "num_omics": 3,
+    "hidden_dim": 64,
+    "num_relation_heads": 4,
+    "relation_head_dim": 16,
+    "num_relation_queries": 8,
+    "num_time_intervals": 15,
+    "time_embedding_dim": 16,
+    "pair_chunk_size": 262144,
+    "dropout": 0.2,
+    "unknown_context_probability": 0.25,
+    "modality_dropout_probability": 0.15,
+    "adapter_rank": 4,
+    "adapter_bottleneck": 8,
+    "relation_mode": "full",
+    "survival_head": "discrete",
+    "topk_pairs_per_block": 4096
+  },
+  "data": {
+    "train": "../data/processed/fold_0/train.pt",
+    "validation": "../data/processed/fold_0/validation.pt",
+    "test": "../data/processed/fold_0/test.pt",
+    "modalities": [0, 1, 2],
+    "ppi_edges": "../data/processed/fold_0/ppi_edges.tsv"
+  },
+  "optimisation": {
+    "learning_rate": 0.0002,
+    "weight_decay": 0.0001,
+    "max_epochs": 200,
+    "patience": 20,
+    "max_grad_norm": 1.0,
+    "cancer_balance_gamma": 0.5,
+    "per_device_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "expected_global_batch_size": 8
+  },
+  "runtime": {
+    "seed": 2026,
+    "num_workers": 2,
+    "amp": "bf16",
+    "deterministic": true,
+    "output_dir": "../runs/rtx4090_fold_0"
+  }
+}
