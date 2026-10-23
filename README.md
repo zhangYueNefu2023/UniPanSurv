@@ -116,4 +116,75 @@ are never mixed within one job.
 Every run writes:
 
 - `resolved_config.json`: exact paths and hyperparameters;
-- `history.js
+- `history.jsonl`: epoch-level training/validation loss and C-index;
+- `best.pt`: model, optimiser, epoch and resolved configuration;
+- `summary.json`: best epoch, final metrics, wall time, world size, effective
+  global batch size and per-worker peak allocated GPU memory.
+
+## Ablation experiments
+
+`configs/ablations.json` contains the complete matrix used by the runner:
+
+- relation controls: full, PPI-constrained, top-k, MLP score control, no relation
+  branch, deterministic random scores and relation write-back;
+- all seven non-empty RNA/miRNA/protein combinations;
+- modality dropout removed;
+- discrete-time, MTLR, DeepHit-style and Cox heads on the same representation.
+
+Run the matrix on four A100s:
+
+```bash
+unipansurv-ablate \
+  --base-config configs/a100_4gpu.json \
+  --matrix configs/ablations.json \
+  --nproc-per-node 4
+```
+
+Use all six RTX 4090s as three independent two-GPU jobs:
+
+```bash
+./scripts/launch_4090_ablation_cluster.sh \
+  configs/rtx4090_2gpu.json configs/ablations.json
+```
+
+The launcher divides the matrix deterministically among three shards and records
+one manifest per shard.  Patient splits are unchanged; modality experiments mask
+tokens after loading the same split files.
+
+Definitions that matter when interpreting the controls:
+
+- `topk` scores all eligible pairs but only encodes the largest absolute scores
+  within each directed omics block; selection is non-differentiable.
+- `random_scores` uses a deterministic feature-pair/head hash, so a patient's
+  input order cannot alter the control.
+- `mlp_control` replaces the bilinear query-key score with an MLP of source token,
+  target token and cancer context while retaining the same edge readout path.
+- `writeback` adds the mean edge message to its target token before assay pooling.
+- the Cox option optimises a Breslow partial likelihood over each mini-batch risk
+  set; use a full-risk-set batch if an exact cohort-wide Cox objective is needed.
+
+The matrix defines computation, not results.  It does not contain hard-coded
+C-indices, IBS values or other manuscript numbers.
+
+## Few-shot target adaptation
+
+After source training, update only the target-specific parameters:
+
+```bash
+unipansurv-adapt \
+  --checkpoint runs/a100_fold_0/best.pt \
+  --data data/processed/target/adaptation.pt \
+  --output runs/target/adapter.pt \
+  --steps 100 \
+  --learning-rate 1e-3 \
+  --reference-penalty 1e-3
+```
+
+The source backbone is frozen.  The output records the source checkpoint,
+configuration, optimiser settings and adapter state, with a separate step-level
+history JSON file.  The regularisation coefficient must be the value selected on
+source cancers treated as pseudo-targets; target-test outcomes must not select it.
+
+## License
+
+UniPanSurv is released under the MIT License. See [LICENSE](LICENSE).
