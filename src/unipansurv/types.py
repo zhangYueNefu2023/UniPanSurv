@@ -31,6 +31,7 @@ class PatientInput:
         num_omics: int,
         num_clinical_features: int,
         num_source_cancers: int,
+        validate_cancer_id: bool = True,
     ) -> None:
         n = self.feature_ids.numel()
         if self.feature_ids.ndim != 1 or self.omics_ids.ndim != 1 or self.values.ndim != 1:
@@ -50,7 +51,11 @@ class PatientInput:
             raise ValueError("feature_ids contains an out-of-range identifier")
         if torch.any(self.omics_ids < 0) or torch.any(self.omics_ids >= num_omics):
             raise ValueError("omics_ids contains an out-of-range identifier")
-        if self.cancer_id is not None and not 0 <= self.cancer_id < num_source_cancers:
+        if (
+            validate_cancer_id
+            and self.cancer_id is not None
+            and not 0 <= self.cancer_id < num_source_cancers
+        ):
             raise ValueError("cancer_id must identify a fitted source cancer")
 
     def to(self, device: torch.device | str) -> "PatientInput":
@@ -69,10 +74,12 @@ class PatientInput:
 class UniPanSurvOutput:
     """Predicted hazards, survival probabilities and compact model summaries."""
 
+    objective_logits: Tensor
     hazard_logits: Tensor
     hazards: Tensor
     survival: Tensor
     risk: Tensor
+    risk_score: Tensor
     patient_representation: Tensor
     relation_summaries: Tensor
     relation_mask: Tensor

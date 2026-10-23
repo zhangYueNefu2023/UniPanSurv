@@ -20,7 +20,7 @@ class TargetAdapter(nn.Module):
         self.context = nn.Parameter(initial_context.detach().clone())
         self.risk_calibration = nn.Parameter(initial_calibration.detach().clone())
         self.relation_lora = RelationLoRA(config.hidden_dim, config.adapter_rank)
-        self.patient_adapter = PatientAdapter(config.hidden_dim, config.adapter_rank)
+        self.patient_adapter = PatientAdapter(config.hidden_dim, config.adapter_bottleneck)
 
     def reset_from_unknown(self, context: Tensor, calibration: Tensor) -> None:
         """Reset the target-specific context and calibration to Unknown values."""

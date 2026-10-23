@@ -4,18 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unipansurv"
-version = "0.1.0"
-description = "Core PyTorch implementation of UniPanSurv"
+version = "0.2.0"
+description = "UniPanSurv pan-cancer survival model, ablations, and distributed training"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "torch>=2.2",
 ]
 
+[project.scripts]
+unipansurv-train = "unipansurv.training:main"
+unipansurv-ablate = "unipansurv.ablation:main"
+unipansurv-adapt = "unipansurv.fewshot:main"
+unipansurv-synthetic = "unipansurv.synthetic:main"
+
 [project.optional-dependencies]
-dev = [
-  "pytest>=7.0",
-]
+dev = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

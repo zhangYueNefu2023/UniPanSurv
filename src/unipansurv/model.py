@@ -9,11 +9,11 @@ from .adaptation import TargetAdapter
 from .config import UniPanSurvConfig
 from .layers import (
     ClinicalEncoder,
-    DiscreteTimeSurvivalHead,
     GatedFusion,
     GatedSetPool,
     MolecularTokenizer,
     RelationEncoder,
+    build_survival_head,
 )
 from .types import PatientInput, UniPanSurvOutput
 
@@ -39,7 +39,7 @@ class UniPanSurv(nn.Module):
             config.num_clinical_features, d, config.dropout
         )
         self.fusion = GatedFusion(d, config.dropout)
-        self.survival_head = DiscreteTimeSurvivalHead(config)
+        self.survival_head = build_survival_head(config)
         self.risk_calibration = nn.Embedding(
             config.num_cancer_contexts, config.num_time_intervals
         )
@@ -54,6 +54,11 @@ class UniPanSurv(nn.Module):
             self.cancer_context.weight[unknown],
             self.risk_calibration.weight[unknown],
         ).to(self.cancer_context.weight.device)
+
+    def set_ppi_edges(self, edges: Tensor) -> None:
+        """Set assay-qualified directed feature pairs for the PPI ablation."""
+
+        self.relation_encoder.set_ppi_edges(edges)
 
     def freeze_backbone(self) -> None:
         """Freeze all source-trained parameters before few-shot adaptation."""
@@ -127,27 +132,50 @@ class UniPanSurv(nn.Module):
         patient: PatientInput,
         mode: PredictionMode,
         target_adapter: Optional[TargetAdapter],
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+    ]:
         cfg = self.config
         patient.validate(
             num_features=cfg.num_features,
             num_omics=cfg.num_omics,
             num_clinical_features=cfg.num_clinical_features,
             num_source_cancers=cfg.num_source_cancers,
+            validate_cancer_id=mode == "source",
         )
         feature_ids, omics_ids, values = self._observed_tokens(patient)
         tokens = self.tokenizer(feature_ids, omics_ids, values)
         context, calibration = self._context_and_calibration(patient, mode, target_adapter)
 
         lora = None if target_adapter is None or mode != "few_shot" else target_adapter.relation_lora
-        relation_summaries, relation_mask = self.relation_encoder(
-            tokens, omics_ids, context, lora=lora
-        )
+        if cfg.relation_mode == "none":
+            relation_summaries = tokens.new_zeros(
+                cfg.num_omics * cfg.num_omics * cfg.num_relation_queries,
+                cfg.hidden_dim,
+            )
+            relation_mask = torch.zeros(
+                relation_summaries.size(0), dtype=torch.bool, device=tokens.device
+            )
+            pooling_tokens = tokens
+        else:
+            relation_summaries, relation_mask, pooling_tokens = self.relation_encoder(
+                tokens, feature_ids, omics_ids, context, lora=lora
+            )
 
         omics_summaries = tokens.new_zeros(cfg.num_omics, cfg.hidden_dim)
         omics_mask = torch.zeros(cfg.num_omics, dtype=torch.bool, device=tokens.device)
         for omics_id in range(cfg.num_omics):
-            selected = tokens[omics_ids == omics_id]
+            selected = pooling_tokens[omics_ids == omics_id]
             pooled, valid = self.omics_pool(selected)
             omics_summaries[omics_id] = pooled[0]
             omics_mask[omics_id] = valid[0]
@@ -168,12 +196,21 @@ class UniPanSurv(nn.Module):
         representation = self.fusion(groups, group_mask)
         if mode == "few_shot" and target_adapter is not None:
             representation = target_adapter.patient_adapter(representation)
-        logits, hazards, survival, risk = self.survival_head(representation, calibration)
-        return (
-            logits,
+        (
+            objective_logits,
+            hazard_logits,
             hazards,
             survival,
             risk,
+            risk_score,
+        ) = self.survival_head(representation, calibration)
+        return (
+            objective_logits,
+            hazard_logits,
+            hazards,
+            survival,
+            risk,
+            risk_score,
             representation,
             relation_summaries,
             relation_mask,
@@ -193,14 +230,16 @@ class UniPanSurv(nn.Module):
         encoded = [self._encode_one(patient, mode, target_adapter) for patient in patients]
         stacked = [torch.stack(items, dim=0) for items in zip(*encoded)]
         return UniPanSurvOutput(
-            hazard_logits=stacked[0],
-            hazards=stacked[1],
-            survival=stacked[2],
-            risk=stacked[3],
-            patient_representation=stacked[4],
-            relation_summaries=stacked[5],
-            relation_mask=stacked[6],
-            omics_summaries=stacked[7],
-            omics_mask=stacked[8],
+            objective_logits=stacked[0],
+            hazard_logits=stacked[1],
+            hazards=stacked[2],
+            survival=stacked[3],
+            risk=stacked[4],
+            risk_score=stacked[5].squeeze(-1),
+            patient_representation=stacked[6],
+            relation_summaries=stacked[7],
+            relation_mask=stacked[8],
+            omics_summaries=stacked[9],
+            omics_mask=stacked[10],
         )
 

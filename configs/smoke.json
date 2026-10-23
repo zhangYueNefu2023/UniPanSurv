@@ -1,0 +1,37 @@
+{
+  "model": {
+    "num_features": 60,
+    "num_source_cancers": 3,
+    "pair_chunk_size": 64,
+    "dropout": 0.0,
+    "unknown_context_probability": 0.0,
+    "modality_dropout_probability": 0.0,
+    "relation_mode": "full",
+    "survival_head": "discrete"
+  },
+  "data": {
+    "train": "../data/synthetic/train.pt",
+    "validation": "../data/synthetic/validation.pt",
+    "test": "../data/synthetic/test.pt",
+    "modalities": [0, 1, 2],
+    "ppi_edges": "../data/synthetic/ppi_edges.tsv"
+  },
+  "optimisation": {
+    "learning_rate": 0.0002,
+    "weight_decay": 0.0001,
+    "max_epochs": 2,
+    "patience": 2,
+    "max_grad_norm": 1.0,
+    "cancer_balance_gamma": 0.5,
+    "per_device_batch_size": 2,
+    "gradient_accumulation_steps": 1,
+    "expected_global_batch_size": 2
+  },
+  "runtime": {
+    "seed": 2026,
+    "num_workers": 0,
+    "amp": "none",
+    "deterministic": true,
+    "output_dir": "../runs/smoke"
+  }
+}

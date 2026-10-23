@@ -106,8 +106,8 @@ class RelationEncoder(nn.Module):
     """Score and pool every observed directed within-patient molecular pair.
 
     Pairs are enumerated by directed omics block and processed in chunks. The
-    molecular tokens are read-only: this layer returns relation summaries and
-    never writes aggregated messages back into the tokens.
+    default model keeps molecular tokens read-only.  The explicit ``writeback``
+    ablation additionally returns tokens updated with aggregated edge messages.
     """
 
     def __init__(self, config: UniPanSurvConfig) -> None:
@@ -140,7 +140,36 @@ class RelationEncoder(nn.Module):
         self.readout_bias = nn.Parameter(
             torch.zeros(config.num_omics, config.num_omics, config.num_relation_queries)
         )
+        self.score_mlp = nn.Sequential(
+            nn.Linear(3 * d, d),
+            nn.GELU(),
+            nn.Linear(d, h),
+        )
+        self.writeback_projection = nn.Linear(d, d)
+        self.writeback_norm = nn.LayerNorm(d)
+        self.register_buffer(
+            "ppi_edge_codes", torch.empty(0, dtype=torch.long), persistent=True
+        )
         nn.init.normal_(self.readout_queries, std=d**-0.5)
+
+    def set_ppi_edges(self, edges: Tensor) -> None:
+        """Install allowed directed protein-feature pairs for the PPI control.
+
+        ``edges`` must have shape ``[num_edges, 2]`` and contain assay-qualified
+        feature identifiers from the same dictionary used by the dataset.  The
+        caller is responsible for supplying both directions when an undirected
+        PPI resource is intended.
+        """
+
+        if edges.ndim != 2 or edges.size(1) != 2:
+            raise ValueError("PPI edges must have shape [num_edges, 2]")
+        edges = edges.to(device=self.ppi_edge_codes.device, dtype=torch.long)
+        if edges.numel() and (
+            torch.any(edges < 0) or torch.any(edges >= self.config.num_features)
+        ):
+            raise ValueError("PPI edge contains an out-of-range feature identifier")
+        codes = edges[:, 0] * self.config.num_features + edges[:, 1]
+        self.ppi_edge_codes = torch.unique(codes, sorted=True)
 
     def _project(
         self,
@@ -156,40 +185,160 @@ class RelationEncoder(nn.Module):
         shape = (-1, self.config.num_relation_heads, self.config.relation_head_dim)
         return q.reshape(shape), k.reshape(shape)
 
-    def _edge_chunk(
+    def _pair_scores(
         self,
         source_tokens: Tensor,
         target_tokens: Tensor,
         source_q: Tensor,
         target_k: Tensor,
+        context: Tensor,
+        source_feature_ids: Tensor,
+        target_feature_ids: Tensor,
         source_omics: int,
         target_omics: int,
     ) -> Tensor:
-        scores = torch.einsum("shd,thd->sth", source_q, target_k)
-        scores = scores * self.log_scale.exp().view(1, 1, -1)
-        scores = scores + self.omics_pair_bias[:, source_omics, target_omics].view(1, 1, -1)
+        mode = self.config.relation_mode
+        if mode == "random_scores":
+            head = torch.arange(
+                self.config.num_relation_heads,
+                device=source_tokens.device,
+                dtype=source_tokens.dtype,
+            ).unsqueeze(0)
+            phase = (
+                source_feature_ids.to(source_tokens.dtype).unsqueeze(1) * 12.9898
+                + target_feature_ids.to(source_tokens.dtype).unsqueeze(1) * 78.233
+                + head * 37.719
+            )
+            scores = torch.remainder(torch.sin(phase) * 43758.545, 1.0) * 2.0 - 1.0
+        elif mode == "mlp_control":
+            repeated_context = context.unsqueeze(0).expand(source_tokens.size(0), -1)
+            scores = self.score_mlp(
+                torch.cat((source_tokens, target_tokens, repeated_context), dim=-1)
+            )
+        else:
+            scores = torch.einsum("ehd,ehd->eh", source_q, target_k)
+            scores = scores * self.log_scale.exp().view(1, -1)
+        return scores + self.omics_pair_bias[:, source_omics, target_omics].view(1, -1)
 
-        ns, nt = scores.shape[:2]
-        source = source_tokens[:, None, :].expand(ns, nt, -1)
-        target = target_tokens[None, :, :].expand(ns, nt, -1)
+    def _edge_chunk(
+        self,
+        source_tokens: Tensor,
+        target_tokens: Tensor,
+        scores: Tensor,
+        source_omics: int,
+        target_omics: int,
+    ) -> Tensor:
+        edge_count = scores.size(0)
         relation_id = source_omics * self.config.num_omics + target_omics
         relation_type = self.relation_type_embedding.weight[relation_id]
-        relation_type = relation_type.view(1, 1, -1).expand(ns, nt, -1)
-        edge_input = torch.cat((source, target, scores, relation_type), dim=-1)
+        relation_type = relation_type.view(1, -1).expand(edge_count, -1)
+        edge_input = torch.cat(
+            (source_tokens, target_tokens, scores, relation_type), dim=-1
+        )
         return self.edge_encoder(edge_input)
+
+    def _pair_chunks(
+        self, source_index: Tensor, target_index: Tensor
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Return flat directed-pair index chunks without a dense N by N grid."""
+
+        ns, nt = source_index.numel(), target_index.numel()
+        chunks: list[tuple[Tensor, Tensor]] = []
+        for start in range(0, ns * nt, self.config.pair_chunk_size):
+            flat = torch.arange(
+                start,
+                min(start + self.config.pair_chunk_size, ns * nt),
+                device=source_index.device,
+            )
+            src = source_index[torch.div(flat, nt, rounding_mode="floor")]
+            tgt = target_index[flat.remainder(nt)]
+            valid = src != tgt
+            if torch.any(valid):
+                chunks.append((src[valid], tgt[valid]))
+        return chunks
+
+    def _ppi_filter(
+        self,
+        source_indices: Tensor,
+        target_indices: Tensor,
+        feature_ids: Tensor,
+        source_omics: int,
+        target_omics: int,
+    ) -> tuple[Tensor, Tensor]:
+        # Assay index 2 is protein in the released RNA/miRNA/protein schema.
+        if source_omics != 2 or target_omics != 2:
+            return source_indices[:0], target_indices[:0]
+        if self.ppi_edge_codes.numel() == 0:
+            raise RuntimeError(
+                "relation_mode='ppi' requires set_ppi_edges() or --ppi-edges"
+            )
+        code = (
+            feature_ids[source_indices] * self.config.num_features
+            + feature_ids[target_indices]
+        )
+        position = torch.searchsorted(self.ppi_edge_codes, code)
+        position = position.clamp_max(max(self.ppi_edge_codes.numel() - 1, 0))
+        keep = self.ppi_edge_codes[position] == code
+        return source_indices[keep], target_indices[keep]
+
+    def _select_topk(
+        self,
+        chunks: list[tuple[Tensor, Tensor]],
+        tokens: Tensor,
+        q: Tensor,
+        k: Tensor,
+        context: Tensor,
+        feature_ids: Tensor,
+        source_omics: int,
+        target_omics: int,
+    ) -> list[tuple[Tensor, Tensor]]:
+        best_score = tokens.new_empty(0)
+        best_source = feature_ids.new_empty(0)
+        best_target = feature_ids.new_empty(0)
+        limit = self.config.topk_pairs_per_block
+        with torch.no_grad():
+            for source_indices, target_indices in chunks:
+                scores = self._pair_scores(
+                    tokens[source_indices],
+                    tokens[target_indices],
+                    q[source_indices],
+                    k[target_indices],
+                    context,
+                    feature_ids[source_indices],
+                    feature_ids[target_indices],
+                    source_omics,
+                    target_omics,
+                )
+                importance = scores.abs().amax(dim=-1)
+                best_score = torch.cat((best_score, importance))
+                best_source = torch.cat((best_source, source_indices))
+                best_target = torch.cat((best_target, target_indices))
+                if best_score.numel() > limit:
+                    keep = torch.topk(best_score, k=limit, sorted=False).indices
+                    best_score = best_score[keep]
+                    best_source = best_source[keep]
+                    best_target = best_target[keep]
+        if best_score.numel() == 0:
+            return []
+        keep = torch.topk(
+            best_score, k=min(limit, best_score.numel()), sorted=False
+        ).indices
+        return [(best_source[keep], best_target[keep])]
 
     def forward(
         self,
         tokens: Tensor,
+        feature_ids: Tensor,
         omics_ids: Tensor,
         context: Tensor,
         lora: Optional[RelationLoRA] = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.config
         q, k = self._project(tokens, context, lora)
         block_outputs: list[Tensor] = []
         block_masks: list[Tensor] = []
-        chunk = cfg.pair_chunk_size
+        message_sum = tokens.new_zeros(tokens.shape)
+        message_count = tokens.new_zeros(tokens.size(0), 1)
 
         for source_omics in range(cfg.num_omics):
             source_index = torch.nonzero(omics_ids == source_omics, as_tuple=False).flatten()
@@ -201,30 +350,66 @@ class RelationEncoder(nn.Module):
                 query = self.readout_queries[source_omics, target_omics]
                 query_bias = self.readout_bias[source_omics, target_omics]
 
-                for s0 in range(0, source_index.numel(), chunk):
-                    src_idx = source_index[s0 : s0 + chunk]
-                    for t0 in range(0, target_index.numel(), chunk):
-                        tgt_idx = target_index[t0 : t0 + chunk]
-                        if src_idx.numel() == 0 or tgt_idx.numel() == 0:
-                            continue
-                        edge = self._edge_chunk(
-                            tokens[src_idx],
-                            tokens[tgt_idx],
-                            q[src_idx],
-                            k[tgt_idx],
+                chunks = self._pair_chunks(source_index, target_index)
+                if cfg.relation_mode == "ppi":
+                    chunks = [
+                        self._ppi_filter(
+                            src,
+                            tgt,
+                            feature_ids,
                             source_omics,
                             target_omics,
                         )
-                        valid = src_idx[:, None] != tgt_idx[None, :]
-                        if not torch.any(valid):
-                            continue
-                        edge = edge[valid]
-                        gates = torch.sigmoid(
-                            edge @ query.T / math.sqrt(cfg.hidden_dim) + query_bias
+                        for src, tgt in chunks
+                    ]
+                if cfg.relation_mode == "topk":
+                    chunks = self._select_topk(
+                        chunks,
+                        tokens,
+                        q,
+                        k,
+                        context,
+                        feature_ids,
+                        source_omics,
+                        target_omics,
+                    )
+
+                for src_idx, tgt_idx in chunks:
+                    if src_idx.numel() == 0:
+                        continue
+                    scores = self._pair_scores(
+                        tokens[src_idx],
+                        tokens[tgt_idx],
+                        q[src_idx],
+                        k[tgt_idx],
+                        context,
+                        feature_ids[src_idx],
+                        feature_ids[tgt_idx],
+                        source_omics,
+                        target_omics,
+                    )
+                    edge = self._edge_chunk(
+                        tokens[src_idx],
+                        tokens[tgt_idx],
+                        scores,
+                        source_omics,
+                        target_omics,
+                    )
+                    gates = torch.sigmoid(
+                        edge @ query.T / math.sqrt(cfg.hidden_dim) + query_bias
+                    )
+                    numerator = numerator + gates.T @ edge
+                    denominator = denominator + gates.sum(dim=0)
+                    pair_count += src_idx.numel()
+                    if cfg.relation_mode == "writeback":
+                        message_sum = message_sum.index_add(0, tgt_idx, edge)
+                        message_count = message_count.index_add(
+                            0,
+                            tgt_idx,
+                            torch.ones(
+                                tgt_idx.numel(), 1, device=tokens.device, dtype=tokens.dtype
+                            ),
                         )
-                        numerator = numerator + gates.T @ edge
-                        denominator = denominator + gates.sum(dim=0)
-                        pair_count += int(valid.sum().item())
 
                 if pair_count == 0:
                     summaries = tokens.new_zeros(cfg.num_relation_queries, cfg.hidden_dim)
@@ -239,7 +424,17 @@ class RelationEncoder(nn.Module):
                 block_outputs.append(summaries)
                 block_masks.append(valid_queries)
 
-        return torch.cat(block_outputs, dim=0), torch.cat(block_masks, dim=0)
+        updated_tokens = tokens
+        if cfg.relation_mode == "writeback":
+            message = message_sum / message_count.clamp_min(1.0)
+            updated_tokens = self.writeback_norm(
+                tokens + self.writeback_projection(message)
+            )
+        return (
+            torch.cat(block_outputs, dim=0),
+            torch.cat(block_masks, dim=0),
+            updated_tokens,
+        )
 
 
 class ClinicalEncoder(nn.Module):
@@ -321,7 +516,9 @@ class DiscreteTimeSurvivalHead(nn.Module):
         self.shared_baseline = nn.Parameter(torch.zeros(config.num_time_intervals))
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, patient: Tensor, calibration: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(
+        self, patient: Tensor, calibration: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         time = self.time_embedding.weight
         hidden = torch.tanh(
             self.patient_projection(patient).unsqueeze(0) + self.time_projection(time)
@@ -331,5 +528,86 @@ class DiscreteTimeSurvivalHead(nn.Module):
         hazards = torch.sigmoid(logits)
         survival = torch.cumprod(1.0 - hazards, dim=-1)
         risk = 1.0 - survival
-        return logits, hazards, survival, risk
+        return logits, logits, hazards, survival, risk, risk[-1:]
+
+
+class CategoricalSurvivalHead(nn.Module):
+    """MTLR/DeepHit-style categorical event-time head.
+
+    The final category represents survival beyond the last modelled interval.
+    The two variants share the output parameterisation and differ in their
+    training objectives (see :mod:`unipansurv.losses`).
+    """
+
+    def __init__(self, config: UniPanSurvConfig) -> None:
+        super().__init__()
+        d = config.hidden_dim
+        self.kind = config.survival_head
+        output_dim = (
+            config.num_time_intervals
+            if config.survival_head == "mtlr"
+            else config.num_time_intervals + 1
+        )
+        self.output = nn.Sequential(
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(d, output_dim),
+        )
+        self.calibration = nn.Linear(
+            config.num_time_intervals, output_dim, bias=False
+        )
+
+    def forward(
+        self, patient: Tensor, calibration: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        raw = self.output(patient) + self.calibration(calibration)
+        if self.kind == "mtlr":
+            event_logits = torch.flip(
+                torch.cumsum(torch.flip(raw, dims=(0,)), dim=0), dims=(0,)
+            )
+            logits = torch.cat((event_logits, raw.new_zeros(1)))
+        else:
+            logits = raw
+        probability = torch.softmax(logits, dim=-1)
+        event_probability = probability[:-1]
+        survival = torch.flip(
+            torch.cumsum(torch.flip(probability[1:], dims=(0,)), dim=0), dims=(0,)
+        )
+        survival_before = torch.cat((probability.new_ones(1), survival[:-1]))
+        hazards = event_probability / survival_before.clamp_min(1e-8)
+        hazard_logits = torch.logit(hazards.clamp(1e-7, 1.0 - 1e-7))
+        risk = 1.0 - survival
+        return logits, hazard_logits, hazards, survival, risk, risk[-1:]
+
+
+class CoxSurvivalHead(nn.Module):
+    """Scalar log-relative-risk head for the Cox ablation."""
+
+    def __init__(self, config: UniPanSurvConfig) -> None:
+        super().__init__()
+        self.output = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, 1),
+        )
+
+    def forward(
+        self, patient: Tensor, calibration: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        del calibration
+        score = self.output(patient)
+        empty = score.new_empty(0)
+        return score, empty, empty, empty, empty, score
+
+
+def build_survival_head(config: UniPanSurvConfig) -> nn.Module:
+    if config.survival_head == "discrete":
+        return DiscreteTimeSurvivalHead(config)
+    if config.survival_head in {"mtlr", "deephit"}:
+        return CategoricalSurvivalHead(config)
+    if config.survival_head == "cox":
+        return CoxSurvivalHead(config)
+    raise ValueError(f"unsupported survival head: {config.survival_head}")
 

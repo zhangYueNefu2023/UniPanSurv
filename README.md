@@ -1,241 +1,119 @@
 # UniPanSurv
 
-UniPanSurv is a PyTorch implementation of a shared pan-cancer survival model for
-incomplete RNA, miRNA and protein profiles. The package provides the core model,
-a censoring-aware discrete-time survival objective, source-cancer training
-primitives, zero-shot inference through a learned Unknown cancer context, and a
-restricted target-cancer adapter for few-shot use.
+PyTorch reference implementation of UniPanSurv: a shared pan-cancer survival
+model for incomplete RNA, miRNA and protein profiles.  This repository contains
+the model definition, source training, zero-shot inference primitives, restricted
+few-shot adaptation, prespecified ablations and multi-GPU launch configurations.
 
-## Core architecture
+## Implemented architecture
 
-For each patient, the implemented model:
+- assay-qualified molecular feature, omics-type and continuous-value embeddings;
+- 64-dimensional tokens and four 16-dimensional relation heads;
+- every retained, observed directed non-self pair, streamed in fixed-size blocks;
+- nine directed omics blocks and eight learned relation readout queries per block;
+- read-only molecular tokens in the default model;
+- separate relation, assay and clinical summaries with masked gated fusion;
+- 15-interval discrete-time survival prediction;
+- learned source-cancer contexts plus an Unknown context for zero-shot use;
+- rank-4 relation LoRA, a 64-8-64 patient adapter and interval calibration for
+  target-cancer adaptation.
 
-1. converts each observed assay-qualified molecular measurement into a
-   64-dimensional token using its feature identifier, omics type and standardized
-   value;
-2. evaluates directed non-self molecular pairs within the patient;
-3. processes pairs in bounded chunks and summarizes each of the nine directed
-   RNA/miRNA/protein blocks with eight learned relation queries;
-4. retains the original molecular tokens as a separate omics evidence stream;
-5. combines relation, omics and clinical summaries with masked gated fusion; and
-6. predicts hazards and survival probabilities over 15 discrete time intervals.
-
-The source model contains cancer-specific contexts and an additional learned
-Unknown context. Zero-shot inference uses the Unknown context. Few-shot
-adaptation freezes the source model and updates only the target-specific context,
-rank-4 relation LoRA parameters, a residual patient adapter and interval-specific
-risk calibration.
+The supplied full-data configurations use the manuscript settings: a training-fold
+cap of 2,048 retained features, 262,144 directed pairs per streaming block,
+dropout 0.20, context dropout 0.25, modality dropout 0.15, AdamW learning rate
+`2e-4`, weight decay `1e-4`, maximum gradient norm 1.0, maximum 200 epochs and
+patience 20.
 
 ## Repository layout
 
 ```text
-UniPanSurv/
-├── configs/
-│   ├── a100_4gpu.json
-│   ├── rtx4090_2gpu.json
-│   └── ablations.json
-├── examples/
-│   └── minimal_usage.py
-├── src/
-│   └── unipansurv/
-│       ├── __init__.py
-│       ├── adaptation.py
-│       ├── config.py
-│       ├── layers.py
-│       ├── losses.py
-│       ├── model.py
-│       └── types.py
-├── tests/
-│   └── test_core.py
-├── pyproject.toml
-├── requirements.txt
-└── README.md
+src/unipansurv/
+  model.py          UniPanSurv composition and source/zero/few-shot modes
+  layers.py         tokenizer, relation module, fusion and survival heads
+  adaptation.py     target-specific trainable modules
+  fewshot.py        100-update target adaptation CLI
+  losses.py         discrete, MTLR, DeepHit-style and Cox objectives
+  data.py           validated model-ready dataset format
+  training.py       single-process and DDP training/evaluation/checkpointing
+  ablation.py       reproducible ablation-matrix launcher
+  synthetic.py      small non-scientific dataset for an end-to-end smoke test
+configs/
+  a100_4gpu.json    four A100 80-GB workers, two patients/GPU
+  rtx4090_2gpu.json two RTX 4090 workers, one patient/GPU, four accumulation steps
+  ablations.json    relation, modality, dropout and survival-head ablations
+scripts/
+  launch_a100.sh
+  launch_4090.sh
+  launch_4090_ablation_cluster.sh
+tests/
 ```
 
-## Requirements and installation
+## Installation and verified smoke test
 
-- Python 3.9 or newer
-- PyTorch 2.2 or newer
+Python 3.9 or newer and PyTorch 2.2 or newer are required.
 
 ```bash
 git clone https://github.com/zhangYueNefu2023/UniPanSurv.git
 cd UniPanSurv
-python -m pip install -e ".[dev]"
+python -m pip install -e '.[dev]'
+unipansurv-synthetic --output-dir data/synthetic
+unipansurv-train --config configs/smoke.json
 pytest
 ```
 
-Run the included minimal example with:
+## Model-ready data
+
+Training consumes one `.pt` file per split.  Each file is a dictionary with
+`schema_version`, `metadata` and a non-empty `records` list.  Every record has:
+
+```python
+{
+    "feature_ids": LongTensor[num_observed_tokens],
+    "omics_ids": LongTensor[num_observed_tokens],   # 0=RNA, 1=miRNA, 2=protein
+    "values": FloatTensor[num_observed_tokens],      # training-fold standardised
+    "clinical_values": FloatTensor[3],
+    "clinical_mask": BoolTensor[3],
+    "cancer_id": int,                               # contiguous source ID
+    "observed_time": float,
+    "interval_index": int,                          # 0..14
+    "event": 0.0 or 1.0,
+    "patient_id": str
+}
+```
+
+Feature selection, transformations, imputation, standardisation, interval-grid
+construction and feature-ID mapping must be fitted on the training partition.
+The same mapping and statistics must then be applied unchanged to validation and
+test patients.  The model intentionally does not perform these cohort-dependent
+steps internally, because doing so would make leakage easy.
+
+For `relation_mode="ppi"`, `data.ppi_edges` must point to a two-column TSV of
+directed, assay-qualified integer feature IDs.  Both directions must be listed
+when an undirected interaction resource is intended.  The implementation keeps
+only protein-to-protein pairs (`omics_id=2`) found in that file.
+
+## Distributed training
+
+Primary four-A100 job:
 
 ```bash
-python examples/minimal_usage.py
+./scripts/launch_a100.sh configs/a100_4gpu.json
 ```
 
-The tests cover output shapes, monotonic survival probabilities, permutation
-invariance to molecular-token order, use of the Unknown context in zero-shot
-mode, single-token inputs, and gradient flow through the target adapter.
+This starts four DDP workers with two patients per GPU, giving global batch size
+eight.  The program checks that arithmetic before training.
 
-## Model-ready input
+One two-RTX-4090 auxiliary job:
 
-The public model API starts after cohort construction, feature selection and
-training-fold preprocessing. Each `PatientInput` contains:
-
-| Field | Shape | Description |
-|---|---:|---|
-| `feature_ids` | `[N]` | Assay-qualified feature identifiers |
-| `omics_ids` | `[N]` | Omics identifiers: `0=RNA`, `1=miRNA`, `2=protein` |
-| `values` | `[N]` | Transformed and training-standardized molecular values |
-| `molecular_mask` | `[N]` | Optional mask identifying observed molecular values |
-| `clinical_values` | `[C]` | Training-standardized baseline clinical variables |
-| `clinical_mask` | `[C]` | Mask identifying observed clinical variables |
-| `cancer_id` | scalar | Source-cancer identifier used in source mode |
-
-The same biological entity measured by different assays must receive different
-feature identifiers. Missing molecular values must be removed or masked rather
-than converted into artificial molecular relations. Feature selection, feature
-identifier mapping, transformations, standardization parameters and time-bin
-boundaries must be estimated using the training partition and then applied
-unchanged to validation and test data.
-
-## Minimal model use
-
-```python
-import torch
-
-from unipansurv import PatientInput, UniPanSurv, UniPanSurvConfig
-
-config = UniPanSurvConfig(
-    num_features=2048,
-    num_source_cancers=18,
-    pair_chunk_size=262_144,
-)
-model = UniPanSurv(config)
-
-patient = PatientInput(
-    feature_ids=torch.tensor([10, 25, 900, 1200]),
-    omics_ids=torch.tensor([0, 0, 1, 2]),
-    values=torch.tensor([0.2, -0.4, 1.1, 0.5]),
-    clinical_values=torch.tensor([0.1, 1.0, -0.3]),
-    clinical_mask=torch.tensor([True, True, True]),
-    cancer_id=0,
-)
-
-model.eval()
-with torch.no_grad():
-    output = model([patient], mode="source")
-    print(output.survival.shape)  # torch.Size([1, 15])
+```bash
+./scripts/launch_4090.sh configs/rtx4090_2gpu.json 0,1
 ```
 
-`PatientInput` tensors and the model must be located on the same device.
-`num_features` is the size of the processed assay-qualified feature vocabulary;
-valid feature identifiers therefore range from `0` to `num_features - 1`.
+This starts two workers with one patient per GPU and four gradient-accumulation
+steps, also giving effective global batch size eight.  A100 and RTX 4090 devices
+are never mixed within one job.
 
-## Source-cancer objective
+Every run writes:
 
-```python
-from unipansurv import cancer_balance_weights, discrete_time_survival_nll
-
-model.train()
-output = model(patients, mode="source")
-weights = cancer_balance_weights(
-    cancer_ids,
-    training_cancer_counts,
-    gamma=0.5,
-)
-loss = discrete_time_survival_nll(
-    output.hazard_logits,
-    interval_index,
-    event,
-    sample_weight=weights,
-)
-loss.backward()
-```
-
-`training_cancer_counts` must be calculated from the complete training
-partition, not from an individual mini-batch. During source-mode training, the
-model can replace source-cancer context and calibration with their Unknown
-counterparts and can remove whole observed modalities according to the
-probabilities stored in the configuration.
-
-## Zero-shot inference
-
-```python
-model.eval()
-with torch.no_grad():
-    output = model(target_patients, mode="zero_shot")
-```
-
-Zero-shot mode always uses the Unknown cancer context and Unknown calibration.
-Any `cancer_id` stored in a target input is ignored by the zero-shot forward
-pass. No target survival outcome is consumed during prediction.
-
-## Few-shot adaptation
-
-```python
-import torch
-
-from unipansurv import discrete_time_survival_nll
-
-model.freeze_backbone()
-adapter = model.new_target_adapter()
-adapter.train()
-optimizer = torch.optim.AdamW(adapter.parameters(), lr=1e-3)
-
-for patients, interval_index, event in adaptation_loader:
-    optimizer.zero_grad()
-    output = model(patients, mode="few_shot", target_adapter=adapter)
-    loss = discrete_time_survival_nll(
-        output.hazard_logits,
-        interval_index,
-        event,
-    )
-    loss.backward()
-    optimizer.step()
-```
-
-The adaptation subset and independent target test subset must remain separate.
-Target-test outcomes must not be used to fit the adapter, select
-hyperparameters, or determine the stopping point.
-
-## Experiment configuration snapshots
-
-The `configs/` directory records the experiment settings associated with the
-revision:
-
-- `a100_4gpu.json` describes a four-GPU NVIDIA A100 job with 80 GB memory per
-  GPU, two patients per GPU and an expected global batch size of eight.
-- `rtx4090_2gpu.json` describes a two-GPU NVIDIA RTX 4090 job with one patient
-  per GPU, four gradient-accumulation steps and an expected effective global
-  batch size of eight.
-- `ablations.json` records the prespecified relation, modality, modality-dropout
-  and survival-head comparison matrix.
-
-The distributed cluster comprised four NVIDIA A100 80 GB GPUs and six NVIDIA
-RTX 4090 24 GB GPUs. A100 jobs used four GPUs. The supplied RTX 4090 profile
-describes a two-GPU job scheduled within the six-GPU RTX 4090 pool; A100 and RTX
-4090 devices were not mixed within a single distributed job.
-
-## Configuration scope
-
-The public core forward path currently implements complete relation learning
-and the discrete-time survival head. The additional values accepted by
-`UniPanSurvConfig`—including `relation_mode`, alternative survival-head names,
-top-k settings and DeepHit ranking settings—and the entries in
-`configs/ablations.json` are experiment specifications. 
-
-## Complete-relation computation
-
-The default model does not use positional encodings, top-k filtering,
-PPI/pathway restrictions, or patient-to-patient graph edges. Every valid
-directed non-self molecular pair is included. `pair_chunk_size` is the maximum
-number of directed edges materialized at one time; chunking reduces temporary
-memory use but does not change the set or total number of evaluated pairs.
-
-## Code availability
-
-The public repository is available at:
-
-https://github.com/zhangYueNefu2023/UniPanSurv
-
-No software license file is currently included. In the absence of an explicit
-license, use and redistribution remain subject to applicable copyright law and
-permission from the copyright holders.
+- `resolved_config.json`: exact paths and hyperparameters;
+- `history.js
