@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+build/
+dist/
+data/processed/
+data/synthetic/
+runs/
+*.pt
