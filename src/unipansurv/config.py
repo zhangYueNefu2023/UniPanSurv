@@ -49,6 +49,10 @@ class UniPanSurvConfig:
     deephit_ranking_weight: float = 0.20
     deephit_ranking_temperature: float = 0.10
     eps: float = 1e-8
+    # Concatenation order: molecular identity, assay type, scalar value.
+    feature_embedding_dim: int = 24
+    omics_embedding_dim: int = 8
+    value_embedding_dim: int = 32
 
     def __post_init__(self) -> None:
         if self.num_features <= 0:
@@ -57,6 +61,18 @@ class UniPanSurvConfig:
             raise ValueError("num_source_cancers must be positive")
         if self.num_omics <= 0:
             raise ValueError("num_omics must be positive")
+        component_dims = (
+            self.feature_embedding_dim,
+            self.omics_embedding_dim,
+            self.value_embedding_dim,
+        )
+        if any(dim <= 0 for dim in component_dims):
+            raise ValueError("molecular embedding dimensions must be positive")
+        if sum(component_dims) != self.hidden_dim:
+            raise ValueError(
+                "hidden_dim must equal feature_embedding_dim + "
+                "omics_embedding_dim + value_embedding_dim"
+            )
         if self.hidden_dim != self.num_relation_heads * self.relation_head_dim:
             raise ValueError(
                 "hidden_dim must equal num_relation_heads * relation_head_dim"

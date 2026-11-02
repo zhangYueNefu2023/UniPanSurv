@@ -11,13 +11,15 @@ from .config import UniPanSurvConfig
 
 
 class ValueEncoder(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float) -> None:
+    """Map one standardised scalar to the value component (1 -> 32 -> 32)."""
+
+    def __init__(self, value_dim: int) -> None:
         super().__init__()
         self.network = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+            nn.Linear(1, value_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(value_dim, value_dim),
+            nn.LayerNorm(value_dim),
         )
 
     def forward(self, values: Tensor) -> Tensor:
@@ -25,24 +27,34 @@ class ValueEncoder(nn.Module):
 
 
 class MolecularTokenizer(nn.Module):
-    """Build 64-D tokens from identity, assay type and patient value."""
+    """Concatenate identity (24), assay type (8) and value (32), in that order.
+
+    Layer normalisation belongs to the value MLP. There is no normalisation
+    across the concatenated components and no positional encoding. Network
+    dropout is active only during training.
+    """
 
     def __init__(self, config: UniPanSurvConfig) -> None:
         super().__init__()
-        d = config.hidden_dim
-        self.feature_embedding = nn.Embedding(config.num_features, d)
-        self.omics_embedding = nn.Embedding(config.num_omics, d)
-        self.value_encoder = ValueEncoder(d, config.dropout)
-        self.normalisation = nn.LayerNorm(d)
+        self.feature_embedding = nn.Embedding(
+            config.num_features, config.feature_embedding_dim
+        )
+        self.omics_embedding = nn.Embedding(
+            config.num_omics, config.omics_embedding_dim
+        )
+        self.value_encoder = ValueEncoder(config.value_embedding_dim)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, feature_ids: Tensor, omics_ids: Tensor, values: Tensor) -> Tensor:
-        token = (
-            self.feature_embedding(feature_ids)
-            + self.omics_embedding(omics_ids)
-            + self.value_encoder(values)
+        token = torch.cat(
+            (
+                self.feature_embedding(feature_ids),
+                self.omics_embedding(omics_ids),
+                self.value_encoder(values),
+            ),
+            dim=-1,
         )
-        return self.dropout(self.normalisation(token))
+        return self.dropout(token)
 
 
 class GatedSetPool(nn.Module):
@@ -396,7 +408,7 @@ class RelationEncoder(nn.Module):
                         target_omics,
                     )
                     gates = torch.sigmoid(
-                        edge @ query.T / math.sqrt(cfg.hidden_dim) + query_bias
+                        edge @ query.T + query_bias
                     )
                     numerator = numerator + gates.T @ edge
                     denominator = denominator + gates.sum(dim=0)
@@ -417,7 +429,7 @@ class RelationEncoder(nn.Module):
                         cfg.num_relation_queries, dtype=torch.bool, device=tokens.device
                     )
                 else:
-                    summaries = numerator / denominator.unsqueeze(-1).clamp_min(cfg.eps)
+                    summaries = numerator / (denominator.unsqueeze(-1) + cfg.eps)
                     valid_queries = torch.ones(
                         cfg.num_relation_queries, dtype=torch.bool, device=tokens.device
                     )

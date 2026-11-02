@@ -18,7 +18,7 @@ def discrete_time_survival_nll(
     ``interval_index[p]`` is the interval containing the observed event or
     censoring time. An event contributes survival through earlier intervals and
     the hazard in its event interval. A right-censored observation contributes
-    survival through its censoring interval.
+    survival only through completed intervals before its censoring interval.
     """
 
     if hazard_logits.ndim != 2:
@@ -33,7 +33,6 @@ def discrete_time_survival_nll(
 
     time = torch.arange(intervals, device=hazard_logits.device).unsqueeze(0)
     before = time < interval_index.unsqueeze(1)
-    through = time <= interval_index.unsqueeze(1)
     log_hazard = -F.softplus(-hazard_logits)
     log_survival_step = -F.softplus(hazard_logits)
 
@@ -41,7 +40,7 @@ def discrete_time_survival_nll(
         (log_survival_step * before).sum(dim=1)
         + log_hazard.gather(1, interval_index.unsqueeze(1)).squeeze(1)
     )
-    censor_log_likelihood = (log_survival_step * through).sum(dim=1)
+    censor_log_likelihood = (log_survival_step * before).sum(dim=1)
     log_likelihood = event * event_log_likelihood + (1.0 - event) * censor_log_likelihood
     per_patient = -log_likelihood
 
@@ -100,7 +99,7 @@ def categorical_survival_nll(
             log_likelihood = log_probability[index, observed_interval]
         else:
             log_likelihood = torch.logsumexp(
-                log_probability[index, observed_interval + 1 :], dim=0
+                log_probability[index, observed_interval:], dim=0
             )
         losses.append(-log_likelihood)
     per_patient = torch.stack(losses)

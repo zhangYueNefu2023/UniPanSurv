@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import random
 from pathlib import Path
@@ -70,10 +69,15 @@ def adapt_target(
         generator=torch.Generator().manual_seed(seed),
     )
     optimizer = AdamW(adapter.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    iterator = itertools.cycle(loader)
+    iterator = iter(loader)
     history: list[dict[str, float | int]] = []
     for step in range(steps):
-        batch = next(iterator).to(selected_device)
+        try:
+            cpu_batch = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            cpu_batch = next(iterator)
+        batch = cpu_batch.to(selected_device)
         optimizer.zero_grad(set_to_none=True)
         output = model(batch.patients, mode="few_shot", target_adapter=adapter)
         data_loss = survival_objective(
